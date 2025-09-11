@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy import stats
 
 
 class Model(nn.Module):
@@ -27,57 +28,76 @@ env = gym.make("CartPole-v1")
 model = Model(4, 2)
 optimizer = torch.optim.Adam(model.parameters(), lr = 0.001, weight_decay=0.0000002)
 
-episodes = 1000
+episodes = 3000
 
 points = []
+raw_points = []
 
-for j in range(episodes):
+batch_size = 10
+gamma = 0.99
+
+for j in range(int(episodes/batch_size)):
+# for j in range(episodes):
     print(j)
+    batch_rewards = []
+    batch_log_probs = []
 
-    observation, info = env.reset()
-    ended = False
+    for _ in range(batch_size):
+        observation, info = env.reset()
+        ended = False
 
-    rewards = []
-    probs = []
+        rewards = []
+        log_probs = []
 
-    while (not ended):
+        while not ended:
+            logits = model(observation)
+            m = torch.distributions.Categorical(logits=logits)
+            action = m.sample()
 
-        logits = model(observation)
-        m = torch.distributions.Categorical(logits=logits)
-        action = m.sample()
+            observation, reward, terminated, truncated, info = env.step(action.item())
 
-        observation, reward, terminated, truncated, info = env.step(action.item())
+            rewards.append(reward)
+            log_probs.append(m.log_prob(action))
 
-        rewards.append(reward)
-        probs.append(m.log_prob(action))
+            if terminated or truncated:
+                ended = True
 
-        if (terminated or truncated):
-            ended = True
+        raw_points.append(sum(rewards))
+        # compute returns
+        G = 0
+        returns = np.zeros(len(rewards))
+        for i in reversed(range(len(rewards))):
+            G = G * gamma + rewards[i]
+            returns[i] = G
 
+        # normalize returns per episode
+        returns = torch.tensor(returns, dtype=torch.float32)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-    # Computing Returns
-    G = 0
-    returns = np.zeros(len(rewards))
-    gamma = 0.99
-    for i in reversed(range(len(rewards))):
-        G = G * gamma + rewards[i]
-        returns[i] = G
+        batch_rewards.append(sum(rewards))
+        batch_log_probs.append((torch.stack(log_probs), returns))
 
-    # Updating Model
-    returns = torch.tensor(returns, dtype=torch.float32)
-    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+    # ---- UPDATE STEP ----
+    optimizer.zero_grad()
 
-    loss = -(torch.stack(probs) * returns).sum()
+    # flatten all episodes into one loss
+    all_losses = []
+    for log_probs, returns in batch_log_probs:
+        all_losses.append(-(log_probs * returns).sum())
+
+    loss = torch.stack(all_losses).mean()  # normalize across episodes
 
     loss.backward()
     optimizer.step()
-    optimizer.zero_grad()
 
-    total_reward = 0
-    for i in range(len(rewards)):
-        total_reward += rewards[i]
+    # track mean reward for plotting
+    points.append(np.mean(batch_rewards))
 
-    points.append(total_reward)
-
-plt.plot(points)
+x = np.arange(0, episodes)
+res = stats.linregress(x, raw_points)
+plt.plot(raw_points, 'r', alpha=0.2)
+plt.plot(np.arange(0, episodes, batch_size), points)
+plt.plot(x, res.intercept + res.slope*x, 'g')
+plt.ylabel("Reward")
+plt.xlabel("Episode")
 plt.show()
