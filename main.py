@@ -25,13 +25,14 @@ class Model(nn.Module):
 env = gym.make("CartPole-v1")
 
 model = Model(4, 2)
-optimizer = torch.optim.Adam(model.parameters(), lr = 0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr = 0.001, weight_decay=0.0000002)
 
 episodes = 1000
 
 points = []
 
 for j in range(episodes):
+    print(j)
 
     observation, info = env.reset()
     ended = False
@@ -69,9 +70,8 @@ for j in range(episodes):
     loss = -(torch.stack(probs) * returns).sum()
 
     loss.backward()
-    if (j % 10 == 0):
-        optimizer.step()
-        optimizer.zero_grad()
+    optimizer.step()
+    optimizer.zero_grad()
 
     total_reward = 0
     for i in range(len(rewards)):
