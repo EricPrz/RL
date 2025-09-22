@@ -190,7 +190,7 @@ def train_cartpole_gae(env_name='CartPole-v1', episodes=4000, gamma=0.99, lam=0.
         next_values = []
 
         done = False
-        total_reward = 0
+        total_reward = []
 
         while not done:
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
@@ -247,8 +247,8 @@ def train_cartpole_gae(env_name='CartPole-v1', episodes=4000, gamma=0.99, lam=0.
 
     return policy_net, value_net
 
-def train_cartpole_ppo(env_name='CartPole-v1', episodes=2200, gamma=0.99, lam=0.95, lr=7e-4, eps_clip=0.2, batch_size = 32, ppo_batches = 4):
-    def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+def train_cartpole_ppo(env_name='CartPole-v1', episodes=2500, gamma=0.99, lam=0.95, actor_lr=1e-4, critic_lr=1e-3, eps_clip=0.2, batch_size = 128, ppo_batches = 4):
+    def compute_gae(rewards, values, next_values, dones, gamma=gamma, lam=lam):
         """
         Compute Generalized Advantage Estimation (GAE).
 
@@ -269,7 +269,8 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2200, gamma=0.99, lam=0.
 
         for t in reversed(range(T)):
             mask = 1.0 - dones[t]           # 0 if done, 1 otherwise
-            delta = rewards[t] + gamma * (values[t+1] if t != T - 1 else 0) * mask - values[t]
+            # delta = rewards[t] + gamma * (next_values[t+1] if t < T - 1 else 0) * mask - next_values[t]
+            delta = rewards[t] + gamma * (next_values[t]) * mask - values[t]
             gae = delta + gamma * lam * mask * gae
             advantages[t] = gae
 
@@ -282,13 +283,11 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2200, gamma=0.99, lam=0.
     policy_net = PolicyNetwork(state_dim, action_dim)
     value_net = ValueNetwork(state_dim)
 
-    old_policy_net = PolicyNetwork(state_dim, action_dim)
-
-    policy_optimizer = optim.Adam(policy_net.parameters(), lr=lr)
-    value_optimizer = optim.Adam(value_net.parameters(), lr=lr)
+    policy_optimizer = optim.Adam(policy_net.parameters(), lr=actor_lr)
+    value_optimizer = optim.Adam(value_net.parameters(), lr=critic_lr)
     value_loss_fn = nn.MSELoss()
 
-    total_reward = []
+    total_rewards = []
 
     for episode in range(episodes):
         state, _ = env.reset()
@@ -299,11 +298,12 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2200, gamma=0.99, lam=0.
         values = []
         dones = []
         old_log_probs = []
+        next_values = []
 
         done = False
 
         while not done:
-            states.append(torch.tensor(state))
+            states.append(state)
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
             probs = policy_net(state_tensor)
             value = value_net(state_tensor)
@@ -315,33 +315,34 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2200, gamma=0.99, lam=0.
 
             next_state, reward, terminated, truncated, _ = env.step(action.item())
             done = terminated or truncated
-            total_reward.append(sum(rewards))
 
-            rewards.append(torch.tensor(reward))
+            next_value = value_net(torch.tensor(next_state))
+            next_values.append(next_value.detach())
+            rewards.append(reward)
             values.append(value.squeeze())
-            dones.append(torch.tensor([float(done)]))
+            dones.append(float(done))
 
             state = next_state
+
+        total_rewards.append(sum(rewards))
 
         for _ in range(ppo_batches):
             for j in range(0, len(rewards), batch_size):
                 batch_start, batch_end = (j, j + batch_size)
-                batch_states = torch.stack(states[batch_start:batch_end]).float()          # [batch, state_dim]
-                batch_actions = torch.stack(actions[batch_start:batch_end]).squeeze()
-                batch_values = torch.stack(values[batch_start:batch_end]).detach()
-                batch_rewards = torch.stack(rewards[batch_start:batch_end]).float().detach()
-                batch_dones = torch.stack(dones[batch_start:batch_end]).float().detach()
+                batch_states = torch.tensor(states[batch_start:batch_end])          # [batch, state_dim]
+                batch_actions = torch.tensor(actions[batch_start:batch_end])
+                batch_values = torch.tensor(values[batch_start:batch_end]).detach()
+                batch_next_values = torch.tensor(next_values[batch_start:batch_end])
+                batch_rewards = torch.tensor(rewards[batch_start:batch_end])
+                batch_dones = torch.tensor(dones[batch_start:batch_end])
                 # batch_old_probs = torch.stack(old_log_probs[batch_start:batch_end])
                 batch_old_probs = torch.tensor(old_log_probs[batch_start:batch_end])
 
                 # Compute advantages using GAE
-                advantages = compute_gae(batch_rewards, batch_values, batch_dones, gamma, lam)
+                advantages = compute_gae(batch_rewards, batch_values, batch_next_values, batch_dones, gamma, lam)
                 if len(advantages) > 1:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # normalize
                 returns = advantages + batch_values  # critic target
-
-                old_probs_computed = Categorical(old_policy_net.forward(batch_states)).log_prob(batch_actions)
-                # print(old_probs_computed/batch_old_probs)
 
                 # PPO update
                 m = Categorical(policy_net.forward(batch_states))
@@ -368,13 +369,28 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2200, gamma=0.99, lam=0.
                 value_loss.backward()
                 value_optimizer.step()
 
-        old_policy_net.load_state_dict(policy_net.state_dict())
-
         if (episode+1) % 50 == 0:
-            print(f"Episode {episode+1}, Total Reward: {np.mean(total_reward)}")
-            total_reward = []
+            print(f"Episode {episode+1}, Total Reward: {np.mean(total_rewards)}")
+            total_rewards = []
 
     return policy_net, value_net
 
 policy_net, value_net = train_cartpole_ppo()
+
+env = gym.make("CartPole-v1", render_mode="human")
+
+state, _ = env.reset()
+
+done = False
+while not done:
+    state_tensor = torch.FloatTensor(state).unsqueeze(0)
+    probs = policy_net(state_tensor)
+
+    m = Categorical(probs)
+    action = m.sample()
+
+    next_state, reward, terminated, truncated, _ = env.step(action.item())
+    done = terminated or truncated
+
+    state = next_state
 
