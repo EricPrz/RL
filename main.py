@@ -6,6 +6,29 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Softmax(dim=-1)
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x: torch.Tensor):
+        return self.actor.forward(x), self.critic.forward(x)
+
+
 
 class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128):
@@ -283,12 +306,17 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    policy_net = PolicyNetwork(state_dim, action_dim)
-    value_net = ValueNetwork(state_dim)
+    # policy_net = PolicyNetwork(state_dim, action_dim)
+    # value_net = ValueNetwork(state_dim)
+    actor_critic = ActorCritic(state_dim, action_dim)
+    critic_optim = optim.Adam(actor_critic.critic.parameters(), lr = critic_lr)
+    actor_optim = optim.Adam(actor_critic.actor.parameters(), lr = actor_lr)
 
-    policy_optimizer = optim.Adam(policy_net.parameters(), lr=actor_lr)
-    value_optimizer = optim.Adam(value_net.parameters(), lr=critic_lr)
-    value_loss_fn = nn.MSELoss()
+    critic_loss_fn = nn.MSELoss()
+
+    # policy_optimizer = optim.Adam(policy_net.parameters(), lr=actor_lr)
+    # value_optimizer = optim.Adam(value_net.parameters(), lr=critic_lr)
+    # value_loss_fn = nn.MSELoss()
 
     total_rewards = []
     episode = 0
@@ -310,8 +338,8 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
         while not done:
             states.append(state)
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            probs = policy_net(state_tensor)
-            value = value_net(state_tensor)
+            probs = actor_critic.actor.forward(state_tensor)
+            value = actor_critic.critic(state_tensor)
 
             m = Categorical(probs)
             action = m.sample()
@@ -321,7 +349,7 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
             next_state, reward, terminated, truncated, _ = env.step(action.item())
             done = terminated or truncated
 
-            next_value = value_net(torch.tensor(next_state))
+            next_value = actor_critic.critic.forward(torch.tensor(next_state))
             next_values.append(next_value.detach())
             rewards.append(reward)
             values.append(value.detach().squeeze())
@@ -356,7 +384,7 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
                 returns = batch_advantages + batch_values  # critic target
 
                 # PPO update
-                m = Categorical(policy_net.forward(batch_states))
+                m = Categorical(actor_critic.actor.forward(batch_states))
                 batch_log_probs_new = m.log_prob(batch_actions)
 
                 ratios = torch.exp(batch_log_probs_new - batch_old_probs)
@@ -365,21 +393,21 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Value loss
-                values_pred = value_net(batch_states).view(-1)
+                values_pred = actor_critic.critic.forward(batch_states).view(-1)
                 
                 detached_returns = returns.detach()
 
-                value_loss = 0.5 * value_loss_fn.forward(values_pred, detached_returns)
+                value_loss = 0.5 * critic_loss_fn.forward(values_pred, detached_returns)
 
                 # Update policy
-                policy_optimizer.zero_grad()
+                actor_optim.zero_grad()
                 policy_loss.backward()
-                policy_optimizer.step()
+                actor_optim.step()
 
                 # Update value
-                value_optimizer.zero_grad()
+                critic_optim.zero_grad()
                 value_loss.backward()
-                value_optimizer.step()
+                critic_optim.step()
 
         if (episode+1) % 50 == 0:
             print(f"Episode {episode+1}, Total Reward: {np.mean(total_rewards)}")
@@ -388,28 +416,29 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
 
         episode += 1
 
-    return policy_net, value_net
+    return actor_critic
 
 game = "LunarLander-v3"
+# game = "CartPole-v1"
 
-policy_net, value_net = train_cartpole_ppo(env_name=game, solved_reward=200.0, max_episodes=7000, actor_lr=4e-4, critic_lr=1e-3)
+actor_crit = train_cartpole_ppo(env_name=game, solved_reward=200.0, max_episodes=7000, actor_lr=4e-4, critic_lr=1e-3)
 
 env = gym.make(game, render_mode="human")
 
-torch.save(policy_net, f"{game}Net")
-
-state, _ = env.reset()
-
-done = False
-while not done:
-    state_tensor = torch.FloatTensor(state).unsqueeze(0)
-    probs = policy_net(state_tensor)
-
-    m = Categorical(probs)
-    action = m.sample()
-
-    next_state, reward, terminated, truncated, _ = env.step(action.item())
-    done = terminated or truncated
-
-    state = next_state
+torch.save(actor_crit, f"{game}Net")
+#
+# state, _ = env.reset()
+#
+# done = False
+# while not done:
+#     state_tensor = torch.FloatTensor(state).unsqueeze(0)
+#     probs = policy_net(state_tensor)
+#
+#     m = Categorical(probs)
+#     action = m.sample()
+#
+#     next_state, reward, terminated, truncated, _ = env.step(action.item())
+#     done = terminated or truncated
+#
+#     state = next_state
 
