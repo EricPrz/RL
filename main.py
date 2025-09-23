@@ -13,6 +13,8 @@ class PolicyNetwork(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, action_dim),
             nn.Softmax(dim=-1)
         )
@@ -25,6 +27,8 @@ class ValueNetwork(nn.Module):
         super(ValueNetwork, self).__init__()
         self.fc = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
@@ -247,8 +251,8 @@ def train_cartpole_gae(env_name='CartPole-v1', episodes=4000, gamma=0.99, lam=0.
 
     return policy_net, value_net
 
-def train_cartpole_ppo(env_name='CartPole-v1', episodes=2500, gamma=0.99, lam=0.95, actor_lr=1e-4, critic_lr=1e-3, eps_clip=0.2, batch_size = 128, ppo_batches = 4):
-    def compute_gae(rewards, values, next_values, dones, gamma=gamma, lam=lam):
+def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes=2500, gamma=0.99, lam=0.95, actor_lr=1e-4, critic_lr=1e-3, eps_clip=0.2, batch_size = 128, ppo_batches = 4):
+    def compute_gae(rewards, values, dones, gamma=gamma, lam=lam):
         """
         Compute Generalized Advantage Estimation (GAE).
 
@@ -269,8 +273,7 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2500, gamma=0.99, lam=0.
 
         for t in reversed(range(T)):
             mask = 1.0 - dones[t]           # 0 if done, 1 otherwise
-            # delta = rewards[t] + gamma * (next_values[t+1] if t < T - 1 else 0) * mask - next_values[t]
-            delta = rewards[t] + gamma * (next_values[t]) * mask - values[t]
+            delta = rewards[t] + gamma * (values[t+1] if t < T - 1 else 0) * mask - values[t]
             gae = delta + gamma * lam * mask * gae
             advantages[t] = gae
 
@@ -288,8 +291,10 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2500, gamma=0.99, lam=0.
     value_loss_fn = nn.MSELoss()
 
     total_rewards = []
+    episode = 0
+    max_reward = 0
 
-    for episode in range(episodes):
+    while episode < max_episodes and max_reward < solved_reward:
         state, _ = env.reset()
         
         states = []
@@ -319,44 +324,51 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2500, gamma=0.99, lam=0.
             next_value = value_net(torch.tensor(next_state))
             next_values.append(next_value.detach())
             rewards.append(reward)
-            values.append(value.squeeze())
+            values.append(value.detach().squeeze())
             dones.append(float(done))
 
             state = next_state
 
         total_rewards.append(sum(rewards))
 
+
+        advantages = compute_gae(rewards, values, dones, gamma, lam)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # normalize
+
+        states = torch.tensor(states)          # [batch, state_dim]
+        actions = torch.tensor(actions)
+        values = torch.tensor(values)
+        old_probs = torch.tensor(old_log_probs)
+
         for _ in range(ppo_batches):
             for j in range(0, len(rewards), batch_size):
                 batch_start, batch_end = (j, j + batch_size)
-                batch_states = torch.tensor(states[batch_start:batch_end])          # [batch, state_dim]
-                batch_actions = torch.tensor(actions[batch_start:batch_end])
-                batch_values = torch.tensor(values[batch_start:batch_end]).detach()
-                batch_next_values = torch.tensor(next_values[batch_start:batch_end])
-                batch_rewards = torch.tensor(rewards[batch_start:batch_end])
-                batch_dones = torch.tensor(dones[batch_start:batch_end])
-                # batch_old_probs = torch.stack(old_log_probs[batch_start:batch_end])
-                batch_old_probs = torch.tensor(old_log_probs[batch_start:batch_end])
+                batch_end = min(batch_start + batch_size, len(rewards))
+
+                batch_states = states[batch_start:batch_end]
+                batch_actions = actions[batch_start:batch_end]
+                batch_values = values[batch_start:batch_end]
+                batch_advantages = advantages[batch_start:batch_end]
+                batch_old_probs = old_probs[batch_start:batch_end]
 
                 # Compute advantages using GAE
-                advantages = compute_gae(batch_rewards, batch_values, batch_next_values, batch_dones, gamma, lam)
-                if len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # normalize
-                returns = advantages + batch_values  # critic target
+                returns = batch_advantages + batch_values  # critic target
 
                 # PPO update
                 m = Categorical(policy_net.forward(batch_states))
                 batch_log_probs_new = m.log_prob(batch_actions)
 
                 ratios = torch.exp(batch_log_probs_new - batch_old_probs)
-                surr1 = ratios * advantages.detach()
-                surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages.detach()
+                surr1 = ratios * batch_advantages.detach()
+                surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * batch_advantages.detach()
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Value loss
-                values_pred = value_net(batch_states).squeeze()
+                values_pred = value_net(batch_states).view(-1)
                 
                 detached_returns = returns.detach()
+
                 value_loss = 0.5 * value_loss_fn.forward(values_pred, detached_returns)
 
                 # Update policy
@@ -371,13 +383,20 @@ def train_cartpole_ppo(env_name='CartPole-v1', episodes=2500, gamma=0.99, lam=0.
 
         if (episode+1) % 50 == 0:
             print(f"Episode {episode+1}, Total Reward: {np.mean(total_rewards)}")
+            max_reward = np.mean(total_rewards)
             total_rewards = []
+
+        episode += 1
 
     return policy_net, value_net
 
-policy_net, value_net = train_cartpole_ppo()
+game = "LunarLander-v3"
 
-env = gym.make("CartPole-v1", render_mode="human")
+policy_net, value_net = train_cartpole_ppo(env_name=game, solved_reward=200.0, max_episodes=7000, actor_lr=4e-4, critic_lr=1e-3)
+
+env = gym.make(game, render_mode="human")
+
+torch.save(policy_net, f"{game}Net")
 
 state, _ = env.reset()
 
