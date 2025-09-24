@@ -50,7 +50,7 @@ game = "LunarLander-v3"
 # game = "CartPole-v1"
 episodes = 5
 
-env = gym.make(game, render_mode="human")
+env = gym.make(game, render_mode="human", enable_wind=False)
 
 actor_critic = torch.load(f"{game}Net", weights_only=False)
 

@@ -310,7 +310,7 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
 
         return advantages
 
-    env = gym.make(env_name)
+    env = gym.make(env_name, enable_wind=False)
     env = NormalizeReward(env)
 
     state_dim = env.observation_space.shape[0]
@@ -435,7 +435,7 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
 game = "LunarLander-v3"
 # game = "CartPole-v1"
 
-actor_crit = train_cartpole_ppo(env_name=game, load = True, solved_reward=320.0, max_episodes=1000, actor_lr=1e-4, critic_lr=1e-3, batch_size=256)
+actor_crit = train_cartpole_ppo(env_name=game, load = True, solved_reward=320.0, max_episodes=1000, actor_lr=2e-5, critic_lr=1e-4, gamma=0.999, batch_size=256)
 
 
 torch.save(actor_crit, f"{game}Net")
