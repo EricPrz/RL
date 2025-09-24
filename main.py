@@ -5,10 +5,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
+from gymnasium.wrappers import NormalizeObservation
+from gymnasium.wrappers import NormalizeReward
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
         super().__init__()
+        self.norm = nn.BatchNorm1d(state_dim)
         self.actor = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -26,7 +29,8 @@ class ActorCritic(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        return self.actor.forward(x), self.critic.forward(x)
+        x = self.norm(x)
+        return self.actor(x), self.critic(x)
 
 
 
@@ -274,7 +278,7 @@ def train_cartpole_gae(env_name='CartPole-v1', episodes=4000, gamma=0.99, lam=0.
 
     return policy_net, value_net
 
-def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes=2500, gamma=0.99, lam=0.95, actor_lr=1e-4, critic_lr=1e-3, eps_clip=0.2, batch_size = 128, ppo_batches = 4):
+def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0, max_episodes=2500, eval_episodes = 10, gamma=0.99, lam=0.95, actor_lr=1e-4, critic_lr=1e-3, eps_clip=0.2, batch_size = 128, ppo_batches = 4):
     def compute_gae(rewards, values, dones, gamma=gamma, lam=lam):
         """
         Compute Generalized Advantage Estimation (GAE).
@@ -303,12 +307,17 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
         return advantages
 
     env = gym.make(env_name)
+    env = NormalizeReward(env)
+
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
     # policy_net = PolicyNetwork(state_dim, action_dim)
     # value_net = ValueNetwork(state_dim)
-    actor_critic = ActorCritic(state_dim, action_dim)
+    if load:
+        actor_critic = torch.load(f"{game}Net", weights_only=False)
+    else:
+        actor_critic = ActorCritic(state_dim, action_dim)
     critic_optim = optim.Adam(actor_critic.critic.parameters(), lr = critic_lr)
     actor_optim = optim.Adam(actor_critic.actor.parameters(), lr = actor_lr)
 
@@ -322,6 +331,7 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
     episode = 0
     max_reward = 0
 
+    actor_critic.train()
     while episode < max_episodes and max_reward < solved_reward:
         state, _ = env.reset()
         
@@ -421,24 +431,24 @@ def train_cartpole_ppo(env_name='CartPole-v1', solved_reward=500.0, max_episodes
 game = "LunarLander-v3"
 # game = "CartPole-v1"
 
-actor_crit = train_cartpole_ppo(env_name=game, solved_reward=200.0, max_episodes=7000, actor_lr=4e-4, critic_lr=1e-3)
+actor_crit = train_cartpole_ppo(env_name=game, load = True, solved_reward=320.0, max_episodes=5000, actor_lr=1e-4, critic_lr=1e-3)
 
-env = gym.make(game, render_mode="human")
 
 torch.save(actor_crit, f"{game}Net")
-#
-# state, _ = env.reset()
-#
-# done = False
-# while not done:
-#     state_tensor = torch.FloatTensor(state).unsqueeze(0)
-#     probs = policy_net(state_tensor)
-#
-#     m = Categorical(probs)
-#     action = m.sample()
-#
-#     next_state, reward, terminated, truncated, _ = env.step(action.item())
-#     done = terminated or truncated
-#
-#     state = next_state
+print(f"Model {game}Net saved")
+
+env = gym.make(game, render_mode="human")
+state, _ = env.reset()
+
+actor_crit.eval()
+done = False
+while not done:
+    state_tensor = torch.FloatTensor(state).unsqueeze(0)
+    probs = actor_crit.actor.forward(state_tensor)
+    action = torch.argmax(probs)
+
+    next_state, reward, terminated, truncated, _ = env.step(action.item())
+    done = terminated or truncated
+
+    state = next_state
 
