@@ -6,24 +6,30 @@ import torch.nn as nn
 class ActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
         super().__init__()
+        self.norm = nn.BatchNorm1d(state_dim)
         self.actor = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, action_dim),
             nn.Softmax(dim=-1)
         )
         self.critic = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x: torch.Tensor):
-        return self.actor.forward(x), self.critic.forward(x)
+        x = self.norm(x)
+        return self.actor(x), self.critic(x)
 
 class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128):

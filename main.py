@@ -14,17 +14,21 @@ class ActorCritic(nn.Module):
         self.norm = nn.BatchNorm1d(state_dim)
         self.actor = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, action_dim),
             nn.Softmax(dim=-1)
         )
         self.critic = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
 
@@ -431,7 +435,7 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
 game = "LunarLander-v3"
 # game = "CartPole-v1"
 
-actor_crit = train_cartpole_ppo(env_name=game, load = True, solved_reward=320.0, max_episodes=5000, actor_lr=1e-4, critic_lr=1e-3)
+actor_crit = train_cartpole_ppo(env_name=game, load = True, solved_reward=320.0, max_episodes=1000, actor_lr=1e-4, critic_lr=1e-3, batch_size=256)
 
 
 torch.save(actor_crit, f"{game}Net")
