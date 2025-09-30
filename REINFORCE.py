@@ -41,6 +41,7 @@ class ReplayBuffer:
         self.rewards = []
         self.next_states = []
         self.dones = []
+        self.lengths = []
 
     def add(self, state, action, prob, reward, next_state, done) -> None:
         self.states.append(state)
@@ -53,11 +54,14 @@ class ReplayBuffer:
     def len(self) -> int:
         return self.states.__len__()
 
+    def note_len(self, length):
+        self.lengths.append(length)
+
     def get_batch(self, batch_size: int):
         pass
 
     def get_all(self):
-        return self.states, self.actions, self.probs, self.rewards, self.next_states, self.dones
+        return self.states, self.actions, self.probs, self.rewards, self.next_states, self.dones, self.lengths
 
     def clear(self):
         self.states.clear()
@@ -66,6 +70,7 @@ class ReplayBuffer:
         self.rewards.clear()
         self.next_states.clear()
         self.dones.clear()
+        self.lengths.clear()
 
 # Function that compute returns from rewards
 def compute_returns(rewards, gamma = 0.99):
@@ -97,11 +102,14 @@ class REINFORCE:
 
             done = False
 
+            length = 0
             while not done:
                 probs = self.model.actor(torch.tensor(state))
                 m = Categorical(probs)
                 action = m.sample()
                 prob = m.log_prob(action)
+
+                length += 1
 
                 next_state, reward, terminated, truncated, _ = env.step(action.item())
                 done = terminated or truncated
@@ -109,30 +117,47 @@ class REINFORCE:
 
                 state = next_state
 
+            self.replay_buffer.note_len(length)
 
-            if self.replay_buffer.len() <= 0:
-                return
-            states, actions, old_probs, rewards, next_states, dones = self.replay_buffer.get_all()
 
-            old_probs = torch.stack(old_probs)
-            returns = compute_returns(rewards)
+        if self.replay_buffer.len() <= 0:
+            return
+        states, actions, old_probs, rewards, next_states, dones, lengths = self.replay_buffer.get_all()
 
-            V = self.model.critic(torch.tensor(states)).squeeze()
+        for l in range(len(lengths)):
+            
+            batch_start = sum(lengths[:l])
+            batch_end = batch_start + lengths[l]
+
+            batch_rewards = rewards[batch_start:batch_end]
+            batch_states = states[batch_start:batch_end]
+            batch_actions = actions[batch_start:batch_end]
+            batch_old_probs = self.model.actor(torch.tensor(batch_states))
+            batch_old_probs = Categorical(batch_old_probs).log_prob(torch.tensor(batch_actions))
+
+            returns = compute_returns(batch_rewards)
+
+            V = self.model.critic(torch.tensor(batch_states)).squeeze()
+
             advantage = returns - V.detach()
 
-            actor_loss = -torch.mean(old_probs * advantage)
+
             self.actor_optim.zero_grad()
+            actor_loss = -(batch_old_probs * advantage).mean()
             actor_loss.backward()
             self.actor_optim.step()
-            
+
             self.critic_optim.zero_grad()
             critic_loss = 0.5 * self.critic_loss(V, returns)
             critic_loss.backward()
             self.critic_optim.step()
 
-            self.replay_buffer.clear()
 
-    def eval(self, episode_number = 5):
+            
+
+        self.replay_buffer.clear()
+
+    def eval(self, episode_number = 15):
         env = self.env
 
         total_rewards = 0
@@ -157,7 +182,7 @@ class REINFORCE:
         return total_rewards/episode_number
 
 
-reinforce = REINFORCE()
+reinforce = REINFORCE(actor_lr=3e-5, critic_lr=1e-4)
 for i in range(20):
     reinforce.model.train()
     reinforce.train(100)
