@@ -283,7 +283,7 @@ def train_cartpole_gae(env_name='CartPole-v1', episodes=4000, gamma=0.99, lam=0.
     return policy_net, value_net
 
 def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0, max_episodes=2500, eval_episodes = 10, gamma=0.99, lam=0.95, actor_lr=1e-4, critic_lr=1e-3, eps_clip=0.2, batch_size = 128, ppo_batches = 4):
-    def compute_gae(rewards, values, dones, gamma=gamma, lam=lam):
+    def compute_gae(rewards, values, next_values, dones, gamma=gamma, lam=lam):
         """
         Compute Generalized Advantage Estimation (GAE).
 
@@ -304,14 +304,14 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
 
         for t in reversed(range(T)):
             mask = 1.0 - dones[t]           # 0 if done, 1 otherwise
-            delta = rewards[t] + gamma * (values[t+1] if t < T - 1 else 0) * mask - values[t]
+            delta = rewards[t] + gamma * next_values[t].detach() * mask - values[t].detach()
             gae = delta + gamma * lam * mask * gae
             advantages[t] = gae
 
         return advantages
 
-    env = gym.make(env_name, enable_wind=False)
-    env = NormalizeReward(env)
+    env = gym.make(env_name)
+    # env = NormalizeReward(env)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
@@ -358,15 +358,15 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
             m = Categorical(probs)
             action = m.sample()
             actions.append(action)
-            old_log_probs.append(m.log_prob(action).detach())
+            old_log_probs.append(m.log_prob(action))
 
             next_state, reward, terminated, truncated, _ = env.step(action.item())
             done = terminated or truncated
 
             next_value = actor_critic.critic.forward(torch.tensor(next_state))
-            next_values.append(next_value.detach())
+            next_values.append(next_value)
             rewards.append(reward)
-            values.append(value.detach().squeeze())
+            values.append(value.squeeze())
             dones.append(float(done))
 
             state = next_state
@@ -374,14 +374,14 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
         total_rewards.append(sum(rewards))
 
 
-        advantages = compute_gae(rewards, values, dones, gamma, lam)
+        advantages = compute_gae(rewards, values, next_values, dones, gamma, lam)
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # normalize
 
         states = torch.tensor(states)          # [batch, state_dim]
         actions = torch.tensor(actions)
-        values = torch.tensor(values)
-        old_probs = torch.tensor(old_log_probs)
+        values = torch.stack(values)
+        old_probs = torch.stack(old_log_probs)
 
         for _ in range(ppo_batches):
             for j in range(0, len(rewards), batch_size):
@@ -394,14 +394,12 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
                 batch_advantages = advantages[batch_start:batch_end]
                 batch_old_probs = old_probs[batch_start:batch_end]
 
-                # Compute advantages using GAE
-                returns = batch_advantages + batch_values  # critic target
 
                 # PPO update
                 m = Categorical(actor_critic.actor.forward(batch_states))
                 batch_log_probs_new = m.log_prob(batch_actions)
 
-                ratios = torch.exp(batch_log_probs_new - batch_old_probs)
+                ratios = torch.exp(batch_log_probs_new.detach() - batch_old_probs.detach())
                 surr1 = ratios * batch_advantages.detach()
                 surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * batch_advantages.detach()
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -409,6 +407,8 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
                 # Value loss
                 values_pred = actor_critic.critic.forward(batch_states).view(-1)
                 
+                # Compute advantages using GAE
+                returns = batch_advantages + batch_values.detach()  # critic target
                 detached_returns = returns.detach()
 
                 value_loss = 0.5 * critic_loss_fn.forward(values_pred, detached_returns)
@@ -432,10 +432,165 @@ def train_cartpole_ppo(env_name='CartPole-v1', load = False, solved_reward=500.0
 
     return actor_critic
 
-game = "LunarLander-v3"
-# game = "CartPole-v1"
 
-actor_crit = train_cartpole_ppo(env_name=game, load = True, solved_reward=320.0, max_episodes=1000, actor_lr=2e-5, critic_lr=1e-4, gamma=0.999, batch_size=256)
+def train_cartpole_ppo_chat(env_name='CartPole-v1', load = False, solved_reward=500.0, max_episodes=2500, eval_episodes = 10, gamma=0.99, lam=0.95, actor_lr=1e-4, critic_lr=1e-3, eps_clip=0.2, batch_size = 128, ppo_batches = 4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def compute_gae(rewards, values, next_values, dones, gamma=gamma, lam=lam):
+        """
+        rewards: list or 1D tensor length T
+        values: tensor shape [T] (V(s_t))
+        next_values: tensor shape [T] (V(s_{t+1}) for each step; for final step this can be 0 or bootstrap)
+        dones: list or tensor length T (1.0 if done after step t, else 0.0)
+        returns advantages tensor shape [T]
+        """
+        T = len(rewards)
+        advantages = torch.zeros(T, device=device, dtype=torch.float32)
+        gae = 0.0
+        for t in reversed(range(T)):
+            mask = 1.0 - float(dones[t])  # 0 if done, 1 otherwise
+            # use next_values[t] as V(s_{t+1})
+            delta = float(rewards[t]) + gamma * (float(next_values[t]) * mask) - float(values[t])
+            gae = delta + gamma * lam * mask * gae
+            advantages[t] = gae
+        return advantages
+
+    env = gym.make(env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+
+    # assume ActorCritic is your defined model class; ensure it .to(device)
+    if load:
+        actor_critic = torch.load(f"{env_name}Net", map_location=device)
+    else:
+        actor_critic = ActorCritic(state_dim, action_dim)
+    actor_critic.to(device)
+
+    critic_optim = optim.Adam(actor_critic.critic.parameters(), lr = critic_lr)
+    actor_optim = optim.Adam(actor_critic.actor.parameters(), lr = actor_lr)
+    critic_loss_fn = nn.MSELoss()
+
+    total_rewards = []
+    episode = 0
+    max_reward = -np.inf
+
+    actor_critic.train()
+    while episode < max_episodes and max_reward < solved_reward:
+        state, _ = env.reset()
+        done = False
+
+        # rollout buffers for one episode
+        states = []
+        actions = []
+        rewards = []
+        values = []
+        dones = []
+        old_log_probs = []
+        next_values = []
+
+        while not done:
+            states.append(state)
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)  # [1, state_dim]
+
+            with torch.no_grad():
+                probs = actor_critic.actor(state_tensor)  # assume gives probabilities
+                value = actor_critic.critic(state_tensor).view(-1)  # shape [1]
+
+            m = Categorical(probs)
+            action = m.sample()
+            logp = m.log_prob(action)
+
+            next_state, reward, terminated, truncated, _ = env.step(action.item())
+            step_done = terminated or truncated
+
+            # store
+            actions.append(action)
+            old_log_probs.append(logp.detach())    # detach old log prob (stale policy)
+            values.append(value.squeeze().detach()) # store V(s_t) as scalar (we'll use for returns)
+            rewards.append(reward)
+            dones.append(float(step_done))
+
+            # compute V(s_{t+1}) for bootstrap; note: use spectator critic without grad
+            with torch.no_grad():
+                next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(device)
+                next_v = actor_critic.critic(next_state_tensor).view(-1)
+            next_values.append(next_v.squeeze().detach())
+
+            state = next_state
+            done = step_done
+
+        total_rewards.append(sum(rewards))
+
+        # Convert lists to tensors on device
+        states = torch.FloatTensor(states).to(device)        # [T, state_dim]
+        actions = torch.stack(actions).to(device)            # [T]
+        values = torch.stack([v if isinstance(v, torch.Tensor) else torch.tensor(v) for v in values]).to(device).float()  # [T]
+        next_values = torch.stack([nv if isinstance(nv, torch.Tensor) else torch.tensor(nv) for nv in next_values]).to(device).float()  # [T]
+        old_log_probs = torch.stack(old_log_probs).to(device).float()  # [T]
+        rewards_t = rewards  # python list
+        dones_t = dones      # python list
+
+        # compute advantages (tensor)
+        advantages = compute_gae(rewards_t, values, next_values, dones_t, gamma, lam)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        returns = advantages + values  # shape [T]
+
+        # PPO updates: multiple epochs over the collected trajectory
+        T = len(rewards)
+        for _ in range(ppo_batches):
+            # shuffle minibatches
+            perm = torch.randperm(T)
+            for start in range(0, T, batch_size):
+                idx = perm[start:start+batch_size]
+                batch_states = states[idx]
+                batch_actions = actions[idx]
+                batch_values = values[idx]
+                batch_adv = advantages[idx]
+                batch_old_logp = old_log_probs[idx]
+                batch_returns = returns[idx].detach()
+
+                # get new log probs and value preds
+                probs_new = actor_critic.actor(batch_states)
+                m_new = Categorical(probs_new)
+                batch_logp_new = m_new.log_prob(batch_actions)  # important: not detached
+
+                # ratio for policy update (new_logp - old_logp)
+                ratios = torch.exp(batch_logp_new - batch_old_logp)
+
+                surr1 = ratios * batch_adv
+                surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * batch_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # value loss (MSE to returns)
+                values_pred = actor_critic.critic(batch_states).view(-1)
+                value_loss = 0.5 * critic_loss_fn(values_pred, batch_returns)
+
+                # update actor
+                actor_optim.zero_grad()
+                policy_loss.backward()
+                actor_optim.step()
+
+                # update critic
+                critic_optim.zero_grad()
+                value_loss.backward()
+                critic_optim.step()
+
+        # logging
+        if (episode+1) % 10 == 0:
+            mean_recent = np.mean(total_rewards[-50:]) if len(total_rewards) >= 1 else np.mean(total_rewards)
+            print(f"Episode {episode+1}, Episode Reward: {total_rewards[-1]:.2f}, Mean(recent): {mean_recent:.2f}")
+            max_reward = mean_recent
+
+        episode += 1
+
+    return actor_critic
+
+game = "LunarLander-v3"
+game = "CartPole-v1"
+
+actor_crit = train_cartpole_ppo(env_name=game, load = False, solved_reward=240.0, max_episodes=2000, actor_lr=1e-4, critic_lr=1e-3, gamma=0.9, batch_size=128)
 
 
 torch.save(actor_crit, f"{game}Net")
